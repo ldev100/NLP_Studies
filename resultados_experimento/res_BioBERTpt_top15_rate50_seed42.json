@@ -1,0 +1,40 @@
+{
+  "config": "top15_rate50",
+  "model": "BioBERTpt",
+  "seed": 42,
+  "val_f1_sintetico": 1.0,
+  "macro_f1_noise": 0.42559060552394407,
+  "macro_precision_noise": 0.4640490968452161,
+  "macro_recall_noise": 0.393591812267497,
+  "clean_f1": 0.9618523008429216,
+  "clean_precision": 0.9518584517812794,
+  "clean_recall": 0.9720582335071932,
+  "typo_f1": 0.0677854557420204,
+  "typo_precision": 0.08226837060702875,
+  "typo_recall": 0.05763850027979855,
+  "abbrev_f1": 0.7833957553058677,
+  "abbrev_precision": 0.8458298230834035,
+  "abbrev_recall": 0.7295451242551955,
+  "overall_accuracy": 0.9299607423269094,
+  "binary_noise_f1": 0.6606117943866289,
+  "binary_noise_precision": 0.7286767775149575,
+  "binary_noise_recall": 0.6041762805722196,
+  "binary_accuracy": 0.9314137860711736,
+  "confusion_matrix": [
+    [
+      67838,
+      1125,
+      825
+    ],
+    [
+      1594,
+      103,
+      90
+    ],
+    [
+      1837,
+      24,
+      5020
+    ]
+  ]
+}

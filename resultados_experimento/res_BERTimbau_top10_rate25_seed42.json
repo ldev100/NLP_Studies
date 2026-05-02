@@ -1,0 +1,40 @@
+{
+  "config": "top10_rate25",
+  "model": "BERTimbau",
+  "seed": 42,
+  "val_f1_sintetico": 1.0,
+  "macro_f1_noise": 0.2380240899814831,
+  "macro_precision_noise": 0.5671225432478942,
+  "macro_recall_noise": 0.15147307305488358,
+  "clean_f1": 0.9476432937603896,
+  "clean_precision": 0.9030234240526854,
+  "clean_recall": 0.9969018506278916,
+  "typo_f1": 0.04153498871331828,
+  "typo_precision": 0.15081967213114755,
+  "typo_recall": 0.024083769633507852,
+  "abbrev_f1": 0.43451319124964793,
+  "abbrev_precision": 0.9834254143646409,
+  "abbrev_recall": 0.27886237647625933,
+  "overall_accuracy": 0.9025376666022793,
+  "binary_noise_f1": 0.378206124669672,
+  "binary_noise_precision": 0.9153498871331829,
+  "binary_noise_recall": 0.2383424764890282,
+  "binary_accuracy": 0.9034189685145837,
+  "confusion_matrix": [
+    [
+      72399,
+      197,
+      28
+    ],
+    [
+      1853,
+      46,
+      11
+    ],
+    [
+      5922,
+      62,
+      2314
+    ]
+  ]
+}
