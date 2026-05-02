@@ -130,26 +130,6 @@ Two fine-tuned models are provided:
 - **ClinNoiseBERT-base**: Fine-tuned from BERTimbau (`neuralmind/bert-base-portuguese-cased`) on TOP20-R50 configuration. Best ABBREV F1 = 0.826.
 - **ClinNoiseBERT-bio**: Fine-tuned from BioBERTpt (`pucpr/biobertpt-all`) on TOP20-R25 configuration. Best ABBREV F1 = 0.809.
 
-### Usage
-
-```python
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-
-model_path = "models/ClinNoiseBERT-base"
-tokenizer = AutoTokenizer.from_pretrained("neuralmind/bert-base-portuguese-cased")
-model = AutoModelForTokenClassification.from_pretrained(model_path)
-
-# Tokenize input
-tokens = ["Pcte", "em", "BEG", "abdome", "flácido"]
-inputs = tokenizer(tokens, is_split_into_words=True, return_tensors="pt")
-
-# Predict
-outputs = model(**inputs)
-predictions = outputs.logits.argmax(dim=-1)
-
-# Labels: 0=CLEAN, 1=TYPO, 2=ABBREV
-```
-
 ## Reproducing the Experiments
 
 ### Requirements
