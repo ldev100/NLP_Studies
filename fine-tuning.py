@@ -1,0 +1,680 @@
+import json
+import os
+import gc
+import re
+import shutil
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from matplotlib.patches import Patch
+from datasets import Dataset, DatasetDict
+from transformers import (
+    AutoTokenizer,
+    AutoModelForTokenClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForTokenClassification,
+    EarlyStoppingCallback,
+)
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    classification_report,
+    confusion_matrix,
+)
+import evaluate
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["LOKY_MAX_CPU_COUNT"] = "1"
+
+if torch.backends.mps.is_available():
+    print("Apple GPU (MPS) detectada")
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    print("CUDA GPU detectada")
+    DEVICE = torch.device("cuda")
+else:
+    print("Usando CPU")
+    DEVICE = torch.device("cpu")
+
+DATASET_DIR = Path("datasets_experimento_ruido")
+OUTPUT_DIR = Path("resultados_experimento")
+CLEAN_DATASET = Path("clean_synthetic_anamneses_gold_standart_tokens.json")
+TEST_REAL_FILE = Path("test_set_real.json")
+
+MODELS = {
+    "BERTimbau": "neuralmind/bert-base-portuguese-cased",
+    "BioBERTpt": "pucpr/biobertpt-all",
+}
+
+LABEL_LIST = ["CLEAN", "TYPO", "ABBREV"]
+LABEL2ID = {l: i for i, l in enumerate(LABEL_LIST)}
+ID2LABEL = {i: l for i, l in enumerate(LABEL_LIST)}
+
+BATCH_SIZE = 4
+EVAL_BATCH_SIZE = 2
+EPOCHS = 10
+PATIENCE = 3
+LR = 2e-5
+MAX_LEN = 300
+WEIGHT_DECAY = 0.01
+SEEDS = [42, 123, 456]
+
+CLASS_WEIGHTS = torch.tensor([0.2, 5.0, 15.0])
+
+metric = evaluate.load("seqeval")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+class WeightedTrainer(Trainer):
+    def __init__(self, class_weights=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if class_weights is not None:
+            self.class_weights = class_weights.to(DEVICE)
+        else:
+            self.class_weights = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        if self.class_weights is not None:
+            loss_fn = torch.nn.CrossEntropyLoss(
+                weight=self.class_weights, ignore_index=-100,
+            )
+        else:
+            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+        loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+def limpar_memoria():
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+def compute_metrics(p):
+    predictions, labels = p
+    predictions = np.argmax(predictions, axis=2)
+
+    true_preds = []
+    true_labels = []
+    for pred_seq, label_seq in zip(predictions, labels):
+        preds_filtered = []
+        labels_filtered = []
+        for p_val, l_val in zip(pred_seq, label_seq):
+            if l_val != -100:
+                preds_filtered.append(LABEL_LIST[p_val])
+                labels_filtered.append(LABEL_LIST[l_val])
+        true_preds.append(preds_filtered)
+        true_labels.append(labels_filtered)
+
+    results = metric.compute(predictions=true_preds, references=true_labels)
+    return {
+        "precision": results["overall_precision"],
+        "recall": results["overall_recall"],
+        "f1": results["overall_f1"],
+        "accuracy": results["overall_accuracy"],
+    }
+
+
+def tokenize_and_align(examples, tokenizer):
+    tokenized = tokenizer(
+        examples["tokens"],
+        truncation=True,
+        is_split_into_words=True,
+        max_length=MAX_LEN,
+    )
+    labels = []
+    for i, label_set in enumerate(examples["labels"]):
+        word_ids = tokenized.word_ids(batch_index=i)
+        label_ids = []
+        for wid in word_ids:
+            if wid is None:
+                label_ids.append(-100)
+            elif wid < len(label_set):
+                label_ids.append(LABEL2ID[label_set[wid]])
+            else:
+                label_ids.append(-100)
+        labels.append(label_ids)
+    tokenized["labels"] = labels
+    return tokenized
+
+
+def carregar_dataset(filepath):
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+def avaliar_no_test_real(model, tokenizer, test_data):
+    ds = Dataset.from_list(test_data)
+    ds = ds.map(lambda x: tokenize_and_align(x, tokenizer), batched=True)
+
+    data_collator = DataCollatorForTokenClassification(tokenizer)
+
+    eval_args = TrainingArguments(
+        output_dir="./tmp_eval",
+        per_device_eval_batch_size=EVAL_BATCH_SIZE,
+        report_to="none",
+        fp16=False,
+    )
+
+    eval_trainer = Trainer(
+        model=model,
+        args=eval_args,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+
+    predictions = eval_trainer.predict(ds)
+    raw_preds = np.argmax(predictions.predictions, axis=2)
+    raw_labels = predictions.label_ids
+
+    all_preds = []
+    all_labels = []
+    for pred_seq, label_seq in zip(raw_preds, raw_labels):
+        for p_val, l_val in zip(pred_seq, label_seq):
+            if l_val != -100:
+                all_preds.append(p_val)
+                all_labels.append(l_val)
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    report = classification_report(
+        all_labels, all_preds,
+        labels=[0, 1, 2],
+        target_names=LABEL_LIST,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    noise_labels = [1, 2]
+    p, r, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds,
+        labels=noise_labels,
+        average="macro",
+        zero_division=0,
+    )
+
+    binary_preds = np.array([0 if pred == 0 else 1 for pred in all_preds])
+    binary_labels = np.array([0 if lab == 0 else 1 for lab in all_labels])
+
+    binary_report = classification_report(
+        binary_labels, binary_preds,
+        labels=[0, 1],
+        target_names=["CLEAN", "NOISE"],
+        output_dict=True,
+        zero_division=0,
+    )
+
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2])
+
+    metricas = {
+        "macro_f1_noise": float(f1),
+        "macro_precision_noise": float(p),
+        "macro_recall_noise": float(r),
+        "clean_f1": float(report["CLEAN"]["f1-score"]),
+        "clean_precision": float(report["CLEAN"]["precision"]),
+        "clean_recall": float(report["CLEAN"]["recall"]),
+        "typo_f1": float(report["TYPO"]["f1-score"]),
+        "typo_precision": float(report["TYPO"]["precision"]),
+        "typo_recall": float(report["TYPO"]["recall"]),
+        "abbrev_f1": float(report["ABBREV"]["f1-score"]),
+        "abbrev_precision": float(report["ABBREV"]["precision"]),
+        "abbrev_recall": float(report["ABBREV"]["recall"]),
+        "overall_accuracy": float(report["accuracy"]),
+        "binary_noise_f1": float(binary_report["NOISE"]["f1-score"]),
+        "binary_noise_precision": float(binary_report["NOISE"]["precision"]),
+        "binary_noise_recall": float(binary_report["NOISE"]["recall"]),
+        "binary_accuracy": float(binary_report["accuracy"]),
+        "confusion_matrix": cm.tolist(),
+    }
+
+    del eval_trainer, predictions, ds
+    if Path("./tmp_eval").exists():
+        shutil.rmtree("./tmp_eval")
+    limpar_memoria()
+
+    return metricas
+
+def train_and_evaluate(ds_path, model_alias, model_ckpt, test_real_data, seed):
+    limpar_memoria()
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    data = carregar_dataset(ds_path)
+
+    idx = np.random.RandomState(seed).permutation(len(data))
+    split = int(len(data) * 0.8)
+
+    ds = DatasetDict({
+        "train": Dataset.from_list([data[i] for i in idx[:split]]),
+        "val": Dataset.from_list([data[i] for i in idx[split:]]),
+    })
+
+    tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+    tokenized_ds = ds.map(lambda x: tokenize_and_align(x, tokenizer), batched=True)
+
+    del data, ds, idx
+    limpar_memoria()
+
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_ckpt,
+        num_labels=len(LABEL_LIST),
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    ).to(DEVICE)
+
+    config_tag = Path(ds_path).stem.replace("dataset_", "")
+    run_name = f"{model_alias}_{config_tag}_seed{seed}"
+
+    args = TrainingArguments(
+        output_dir=f"./checkpoints/{run_name}",
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=LR,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+        num_train_epochs=EPOCHS,
+        weight_decay=WEIGHT_DECAY,
+        save_total_limit=1,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        report_to="none",
+        seed=seed,
+        fp16=False,
+    )
+
+    data_collator = DataCollatorForTokenClassification(tokenizer)
+
+    trainer = WeightedTrainer(
+        class_weights=CLASS_WEIGHTS,
+        model=model,
+        args=args,
+        train_dataset=tokenized_ds["train"],
+        eval_dataset=tokenized_ds["val"],
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)],
+    )
+
+    print(f"\n>>> [{run_name}]")
+    print(f"    Treino: {len(tokenized_ds['train'])} | Val: {len(tokenized_ds['val'])} | Test real: {len(test_real_data)}")
+
+    trainer.train()
+
+    val_results = trainer.evaluate()
+    print(f"    Val F1 (sintetico): {val_results.get('eval_f1', 0):.4f}")
+
+    del trainer
+    limpar_memoria()
+
+    print(f"    Avaliando no test set REAL...")
+    model.cpu()
+    limpar_memoria()
+    test_metricas = avaliar_no_test_real(model, tokenizer, test_real_data)
+
+    print(f"    -> ABBREV F1:        {test_metricas['abbrev_f1']:.4f}")
+    print(f"    -> TYPO F1:          {test_metricas['typo_f1']:.4f}")
+    print(f"    -> Macro F1 (noise): {test_metricas['macro_f1_noise']:.4f}")
+    print(f"    -> Binary F1:        {test_metricas['binary_noise_f1']:.4f}")
+
+    resultado = {
+        "config": config_tag,
+        "model": model_alias,
+        "seed": seed,
+        "val_f1_sintetico": val_results.get("eval_f1", 0),
+        **test_metricas,
+    }
+
+    result_file = OUTPUT_DIR / f"res_{run_name}.json"
+    with open(result_file, "w") as f:
+        json.dump(resultado, f, indent=2)
+
+    del model, tokenizer, tokenized_ds, data_collator, args, val_results
+    limpar_memoria()
+
+    return resultado
+
+def main():
+    if not TEST_REAL_FILE.exists():
+        print("=" * 60)
+        print(f"ERRO: {TEST_REAL_FILE} nao encontrado!")
+        print("=" * 60)
+        return
+
+    print("[1/4] Carregando test set real...")
+    test_real_data = carregar_dataset(TEST_REAL_FILE)
+    print(f"       {len(test_real_data)} anamneses reais")
+
+    print("[2/4] Listando datasets de treino...")
+    train_datasets = []
+
+    if CLEAN_DATASET.exists():
+        train_datasets.append(("CLEAN", str(CLEAN_DATASET)))
+        print(f"       [ok] CLEAN: {CLEAN_DATASET}")
+
+    random_files = sorted(DATASET_DIR.glob("dataset_random_rate*.json"))
+    if random_files:
+        for f in random_files:
+            config_name = f.stem.replace("dataset_", "").upper()
+            train_datasets.append((config_name, str(f)))
+            print(f"       [ok] {config_name}: {f}")
+    else:
+        print(f"       [!!] RANDOM nao encontrado.")
+
+    for f in sorted(DATASET_DIR.glob("dataset_top*.json")):
+        config_name = f.stem.replace("dataset_", "").upper()
+        train_datasets.append((config_name, str(f)))
+        print(f"       [ok] {config_name}: {f}")
+
+    total_runs = len(train_datasets) * len(MODELS) * len(SEEDS)
+    print(f"\n       Total: {len(train_datasets)} configs x {len(MODELS)} modelos x {len(SEEDS)} seeds = {total_runs} runs")
+    print(f"       Tempo estimado: {total_runs * 10 // 60}-{total_runs * 15 // 60} horas")
+
+    print("[3/4] Executando experimentos...")
+    todos_resultados = []
+    runs_ok = 0
+    runs_erro = 0
+    runs_pulados = 0
+
+    for res_file in sorted(OUTPUT_DIR.glob("res_*.json")):
+        try:
+            with open(res_file, "r") as f:
+                resultado_anterior = json.load(f)
+            if "model" in resultado_anterior and "macro_f1_noise" in resultado_anterior:
+                todos_resultados.append(resultado_anterior)
+        except:
+            pass
+
+    if todos_resultados:
+        print(f"       Carregados {len(todos_resultados)} resultados anteriores")
+
+    melhor_por_modelo = {}
+
+    for r in todos_resultados:
+        try:
+            alias = r["model"]
+            f1 = r["macro_f1_noise"]
+            rname = f"{alias}_{r['config']}_seed{r['seed']}"
+            if alias not in melhor_por_modelo or f1 > melhor_por_modelo[alias]["f1"]:
+                melhor_por_modelo[alias] = {"f1": f1, "run_name": rname}
+        except KeyError:
+            continue
+
+    for config_name, ds_path in train_datasets:
+        for model_alias, model_ckpt in MODELS.items():
+            for seed in SEEDS:
+                config_tag = Path(ds_path).stem.replace("dataset_", "")
+                run_name = f"{model_alias}_{config_tag}_seed{seed}"
+
+                result_file = OUTPUT_DIR / f"res_{run_name}.json"
+                if result_file.exists():
+                    print(f"\n    [PULANDO] {run_name} (ja completado)")
+                    runs_pulados += 1
+                    continue
+
+                try:
+                    resultado = train_and_evaluate(
+                        ds_path, model_alias, model_ckpt, test_real_data, seed
+                    )
+                    todos_resultados.append(resultado)
+                    runs_ok += 1
+
+                    f1_atual = resultado["macro_f1_noise"]
+
+                    if model_alias not in melhor_por_modelo or f1_atual > melhor_por_modelo[model_alias]["f1"]:
+                        if model_alias in melhor_por_modelo:
+                            old_dir = Path(f"./checkpoints/{melhor_por_modelo[model_alias]['run_name']}")
+                            if old_dir.exists():
+                                shutil.rmtree(old_dir)
+                        melhor_por_modelo[model_alias] = {"f1": f1_atual, "run_name": run_name}
+                        print(f"    ** Novo melhor {model_alias}: {run_name} (F1={f1_atual:.4f})")
+                    else:
+                        ckpt_dir = Path(f"./checkpoints/{run_name}")
+                        if ckpt_dir.exists():
+                            shutil.rmtree(ckpt_dir)
+
+                except Exception as e:
+                    print(f"    [ERRO] {config_name}_{model_alias}_seed{seed}: {e}")
+                    runs_erro += 1
+                    limpar_memoria()
+                    continue
+
+                with open(OUTPUT_DIR / "metricas_completas.json", "w") as f:
+                    json.dump(todos_resultados, f, indent=2, ensure_ascii=False)
+
+    print(f"\n    Runs: {runs_ok} novos + {runs_pulados} anteriores")
+    if runs_erro > 0:
+        print(f"    Erros: {runs_erro}")
+
+    modelos_dir = Path("modelos_finais")
+    modelos_dir.mkdir(exist_ok=True)
+
+    for model_alias, info in melhor_por_modelo.items():
+        src = Path(f"./checkpoints/{info['run_name']}")
+        dst = modelos_dir / f"{model_alias}_best"
+        if src.exists():
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            shutil.rmtree(src)
+            print(f"    Modelo salvo: {dst}/ (F1={info['f1']:.4f})")
+
+    ckpt_root = Path("./checkpoints")
+    if ckpt_root.exists():
+        shutil.rmtree(ckpt_root)
+
+    print("[4/4] Gerando tabelas e graficos...")
+    gerar_outputs(todos_resultados)
+
+    print()
+    print("=" * 60)
+    print(f"[OK] Concluido! {runs_ok} novos + {runs_pulados} anteriores")
+    print(f"    Resultados em: {OUTPUT_DIR}/")
+    print("=" * 60)
+
+def gerar_outputs(resultados):
+    if not resultados:
+        print("    [!!] Sem resultados.")
+        return
+
+    df = pd.DataFrame(resultados)
+
+    rename = {
+        'clean_synthetic_anamneses_gold_standart_tokens': 'CLEAN',
+        'random_rate10': 'RANDOM-10',
+        'random_rate25': 'RANDOM-25',
+        'random_rate50': 'RANDOM-50',
+        'top10_rate10': 'TOP10-R10',
+        'top10_rate25': 'TOP10-R25',
+        'top10_rate50': 'TOP10-R50',
+        'top15_rate10': 'TOP15-R10',
+        'top15_rate25': 'TOP15-R25',
+        'top15_rate50': 'TOP15-R50',
+        'top20_rate10': 'TOP20-R10',
+        'top20_rate25': 'TOP20-R25',
+        'top20_rate50': 'TOP20-R50',
+    }
+    df['config'] = df['config'].map(rename).fillna(df['config'])
+
+    order = ["CLEAN",
+             "RANDOM-10", "RANDOM-25", "RANDOM-50",
+             "TOP10-R10", "TOP10-R25", "TOP10-R50",
+             "TOP15-R10", "TOP15-R25", "TOP15-R50",
+             "TOP20-R10", "TOP20-R25", "TOP20-R50"]
+
+    has_binary = "binary_noise_f1" in df.columns
+
+    agg_kwargs = {
+        "macro_f1_mean": ("macro_f1_noise", "mean"),
+        "macro_f1_std": ("macro_f1_noise", "std"),
+        "abbrev_f1_mean": ("abbrev_f1", "mean"),
+        "abbrev_f1_std": ("abbrev_f1", "std"),
+        "typo_f1_mean": ("typo_f1", "mean"),
+        "typo_f1_std": ("typo_f1", "std"),
+    }
+    if has_binary:
+        agg_kwargs["binary_f1_mean"] = ("binary_noise_f1", "mean")
+        agg_kwargs["binary_f1_std"] = ("binary_noise_f1", "std")
+
+    tabela = df.groupby(["config", "model"]).agg(**agg_kwargs).round(4)
+
+    tabela.to_csv(OUTPUT_DIR / "tabela_principal.csv")
+    print(f"    Tabela salva: tabela_principal.csv")
+
+    latex_rows = []
+    for (config, model), row in tabela.iterrows():
+        line = (
+            f"    {config} & {model} & "
+            f"{row['abbrev_f1_mean']:.4f}$\\pm${row['abbrev_f1_std']:.4f} & "
+            f"{row['typo_f1_mean']:.4f}$\\pm${row['typo_f1_std']:.4f} & "
+            f"{row['macro_f1_mean']:.4f}$\\pm${row['macro_f1_std']:.4f}"
+        )
+        if has_binary:
+            line += f" & {row['binary_f1_mean']:.4f}$\\pm${row['binary_f1_std']:.4f}"
+        line += " \\\\"
+        latex_rows.append(line)
+
+    header = "Config & Model & ABBREV F1 & TYPO F1 & Macro F1"
+    if has_binary:
+        header += " & Binary F1"
+    header += " \\\\"
+
+    with open(OUTPUT_DIR / "tabela_latex.txt", "w") as f:
+        f.write(header + "\n")
+        f.write("\\hline\n")
+        f.write("\n".join(latex_rows))
+    print(f"    Tabela LaTeX salva: tabela_latex.txt")
+
+    try:
+        pivot = df.groupby(["config", "model"])["abbrev_f1"].mean().reset_index()
+        pivot_table = pivot.pivot(index="config", columns="model", values="abbrev_f1")
+        existing_order = [o for o in order if o in pivot_table.index]
+        if existing_order:
+            pivot_table = pivot_table.reindex(existing_order)
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+        sns.heatmap(
+            pivot_table, annot=True, fmt=".3f", cmap="YlOrRd",
+            ax=ax, vmin=0, vmax=0.85, linewidths=0.5, linecolor='white',
+            annot_kws={"size": 10},
+        )
+        ax.set_title("ABBREV F1 on Real Clinical Data", fontsize=13, pad=12)
+        ax.set_ylabel("Training Configuration", fontsize=11)
+        ax.set_xlabel("Model", fontsize=11)
+        ax.tick_params(axis='y', labelsize=9)
+        ax.tick_params(axis='x', labelsize=10)
+        ax.axhline(y=1, color='black', linewidth=2)
+        ax.axhline(y=4, color='black', linewidth=2)
+        ax.axhline(y=7, color='black', linewidth=1.5)
+        ax.axhline(y=10, color='black', linewidth=1.5)
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / "grafico_heatmap.png", dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"    Heatmap salvo")
+    except Exception as e:
+        print(f"    [!!] Erro heatmap: {e}")
+
+    try:
+        df_no_clean = df[df['config'] != 'CLEAN']
+        order_barras = [o for o in order if o != "CLEAN"]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+        for idx, model_name in enumerate(MODELS.keys()):
+            model_df = df_no_clean[df_no_clean["model"] == model_name]
+            summary = model_df.groupby("config").agg(
+                f1_mean=("abbrev_f1", "mean"),
+                f1_std=("abbrev_f1", "std"),
+            )
+            existing_barras = [o for o in order_barras if o in summary.index]
+            summary = summary.reindex(existing_barras)
+            colors = ["#f0ad4e" if "RANDOM" in c else "#5cb85c" for c in summary.index]
+
+            axes[idx].barh(
+                range(len(summary)), summary["f1_mean"], xerr=summary["f1_std"],
+                capsize=3, color=colors, edgecolor='white', linewidth=0.5, height=0.7,
+            )
+            axes[idx].set_yticks(range(len(summary)))
+            axes[idx].set_yticklabels(summary.index, fontsize=8)
+            axes[idx].set_xlabel("ABBREV F1", fontsize=10)
+            axes[idx].set_title(f"{model_name}", fontsize=12)
+            axes[idx].set_xlim(0, 0.90)
+            axes[idx].invert_yaxis()
+            axes[idx].grid(axis='x', alpha=0.3)
+
+        legend_elements = [
+            Patch(facecolor='#f0ad4e', label='RANDOM'),
+            Patch(facecolor='#5cb85c', label='EPNI'),
+        ]
+        fig.legend(handles=legend_elements, loc='lower center', ncol=2, fontsize=10,
+                   bbox_to_anchor=(0.5, -0.02))
+        plt.suptitle("Abbreviation Detection Performance on Real Clinical Data", fontsize=13, y=1.01)
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / "grafico_barras.png", dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"    Barras salvo")
+    except Exception as e:
+        print(f"    [!!] Erro barras: {e}")
+
+    try:
+        best_results = [r for r in resultados if "confusion_matrix" in r]
+        if best_results:
+            best = max(best_results, key=lambda x: x.get("abbrev_f1", 0))
+            cm = np.array(best["confusion_matrix"])
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            sns.heatmap(
+                cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=LABEL_LIST, yticklabels=LABEL_LIST,
+                ax=ax, linewidths=0.5, linecolor='white',
+            )
+            ax.set_xlabel("Predicted", fontsize=11)
+            ax.set_ylabel("True", fontsize=11)
+            ax.set_title(
+                f"Confusion Matrix - {best['model']} ({best['config']})",
+                fontsize=12, pad=10,
+            )
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / "confusion_matrix_best.png", dpi=300, bbox_inches="tight")
+            plt.close()
+            print(f"    Confusion matrix salva")
+    except Exception as e:
+        print(f"    [!!] Erro confusion matrix: {e}")
+
+    print()
+    print("=" * 70)
+    print("RESUMO DOS RESULTADOS")
+    print("=" * 70)
+    print(tabela.to_string())
+    print()
+
+    for model_name in MODELS.keys():
+        model_df = df[df["model"] == model_name]
+        if not model_df.empty:
+            best = model_df.loc[model_df["abbrev_f1"].idxmax()]
+            print(f"  Melhor para {model_name}:")
+            print(f"    Config:    {best['config']}")
+            print(f"    ABBREV F1: {best['abbrev_f1']:.4f}")
+            print(f"    TYPO F1:   {best['typo_f1']:.4f}")
+            print(f"    Macro F1:  {best['macro_f1_noise']:.4f}")
+            if "binary_noise_f1" in best:
+                print(f"    Binary F1: {best['binary_noise_f1']:.4f}")
+            print()
+
+
+if __name__ == "__main__":
+    main()
