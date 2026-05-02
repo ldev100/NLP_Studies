@@ -1,4 +1,0 @@
-modelos_finais/BERTimbau_best/checkpoint-960/*.pt filter=lfs diff=lfs merge=lfs -text
-modelos_finais/BERTimbau_best/checkpoint-960/*.safetensors filter=lfs diff=lfs merge=lfs -text
-modelos_finais/BioBERTpt_best/checkpoint-480/*.pt filter=lfs diff=lfs merge=lfs -text
-modelos_finais/BioBERTpt_best/checkpoint-480/*.safetensors filter=lfs diff=lfs merge=lfs -text
