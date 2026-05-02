@@ -18,7 +18,6 @@ epni-framework/
 ├── requirements.txt
 │
 ├── scripts/
-│   ├── 01_gerar_anamneses_gemini.py      # Stage 1: Clean narrative generation
 │   ├── injetar_ruido_ngram.py            # Stage 2: EPNI noise injection (n-gram matching)
 │   ├── gerar_baseline_random.py          # Generates RANDOM baseline datasets
 │   ├── fine_tuning_v3.py                 # Stage 3: Training and evaluation pipeline
