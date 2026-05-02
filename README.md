@@ -1,7 +1,3 @@
-# EPNI: Empirical Probabilistic Noise Injection for Clinical Noise Detection in Brazilian Portuguese
-
-This repository contains the code, synthetic corpus, and trained models for the paper *"Empirical Probabilistic Noise Injection for Clinical Noise Detection in Brazilian Portuguese"*, submitted to BRACIS 2026.
-
 ## Overview
 
 The EPNI framework transforms clean synthetic clinical narratives into realistic noisy text calibrated by real-world noise distributions. The framework operates in three stages:
@@ -148,8 +144,8 @@ python scripts/injetar_ruido_ngram.py
 python scripts/gerar_baseline_random.py
 
 # 3. Run training and evaluation (requires test_set_real.json)
-#    Estimated time: 13-20 hours on Apple M4 16GB
-python scripts/fine_tuning_v3.py
+#    Estimated time: 13-20 hours
+python scripts/fine_tuning.py
 
 # 4. Analyze vocabulary coverage (requires test_set_real.json)
 python scripts/calcular_cobertura_vocabulario.py
