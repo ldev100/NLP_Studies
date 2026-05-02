@@ -24,8 +24,6 @@ epni-framework/
 │   ├── calcular_cobertura_vocabulario.py # Vocabulary coverage analysis
 │   ├── verificar_anotacao.py             # Annotation quality verification
 │   ├── corrigir_anotacao.py              # Taxonomy-assisted annotation correction
-│   ├── cruzar_typo_com_taxonomia.py      # Cross-reference TYPO labels with taxonomy
-│   └── reclassificar_test_set.py         # Reclassify mislabeled tokens
 │
 ├── data/
 │   ├── clean_synthetic_anamneses_gold_standart.json    # 1,150 clean synthetic anamneses
@@ -48,7 +46,7 @@ epni-framework/
 │   ├── dataset_random_rate25.json        # RANDOM baseline, 25%
 │   └── dataset_random_rate50.json        # RANDOM baseline, 50%
 │
-├── models/
+├── modelos_finais/
 │   ├── ClinNoiseBERT-base/              # Best BERTimbau fine-tuned model
 │   └── ClinNoiseBERT-bio/               # Best BioBERTpt fine-tuned model
 │
@@ -66,20 +64,11 @@ epni-framework/
 
 ## Scripts Description
 
-### Stage 1 — Clean Narrative Generation
-
-**`01_gerar_anamneses_gemini.py`**
-Generates clean clinical anamneses using the Gemini 2.0 Flash API. Each anamnesis is validated against a list of common clinical abbreviations to ensure no abbreviations remain in the generated text. Outputs `clean_synthetic_anamneses_gold_standart.json`.
-
-### Stage 2 — Noise Injection
-
 **`injetar_ruido_ngram.py`**
 Core EPNI framework. Reads clean anamneses and noise mapping templates, then injects abbreviations and typographical errors at configurable rates. Uses n-gram matching (4, 3, 2, 1 tokens) to correctly identify and replace multi-token clinical expressions (e.g., "ausculta pulmonar" → "AP", "bom estado geral" → "BEG"). Generates 9 EPNI datasets (3 vocabulary levels × 3 injection rates) plus the CLEAN baseline.
 
 **`gerar_baseline_random.py`**
 Generates 3 RANDOM baseline datasets by applying character-level perturbations (substitution, deletion, insertion, transposition) at matched intensity levels (10%, 25%, 50%) without domain-specific knowledge. These baselines isolate the contribution of empirical noise calibration.
-
-### Stage 3 — Training and Evaluation
 
 **`fine_tuning_v3.py`**
 Complete training and evaluation pipeline. Fine-tunes BERTimbau and BioBERTpt on each of the 13 training configurations with 3 random seeds (78 total runs). Evaluates on the real clinical test set and computes:
@@ -87,8 +76,6 @@ Complete training and evaluation pipeline. Fine-tunes BERTimbau and BioBERTpt on
 - Macro F1 across noise classes
 - Binary F1 (CLEAN vs. NOISE)
 - Confusion matrix
-
-Includes memory management optimizations for Apple Silicon (MPS) with 16GB RAM. Automatically generates summary tables, heatmaps, bar charts, and confusion matrix visualizations.
 
 ### Annotation Quality Tools
 
@@ -187,8 +174,6 @@ python scripts/fine_tuning_v3.py
 # 4. Analyze vocabulary coverage (requires test_set_real.json)
 python scripts/calcular_cobertura_vocabulario.py
 ```
-
-Note: Step 3 requires the real clinical test set (`test_set_real.json`), which is not included due to privacy restrictions. Researchers with access to clinical anamneses in Brazilian Portuguese can create their own test set following the annotation guidelines described in the paper.
 
 ## Key Results
 
