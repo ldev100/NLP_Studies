@@ -1,31 +1,3 @@
-"""
-reavaliar_word_level.py
-
-Recalcula, a partir de UMA unica passada de inferencia por checkpoint, todos os
-numeros que hoje estao espalhados entre a Tabela 2 (sub-token), a Tabela 3
-(palavra), a Tabela 4 (seen/unseen), a Tabela 6 (matriz de confusao) e o
-bootstrap pareado da Secao 5.4.
-
-Tudo sai de um unico arquivo de predicoes por checkpoint, entao as tabelas
-passam a ser consistentes entre si por construcao.
-
-Uso tipico:
-
-    python reavaliar_word_level.py \
-        --checkpoints ckpt/BERTimbau_top20_rate50_seed42 \
-                      ckpt/BERTimbau_top20_rate50_seed123 \
-                      ckpt/BERTimbau_top20_rate50_seed456 \
-        --test test_set_real.json \
-        --top20 template_mapeamento_top20.json \
-        --taxonomia-abbrev potential_abbreviations.json \
-        --taxonomia-typos potential_typos.json \
-        --agregacao majority \
-        --out resultados_word_level.json
-
-Se ja existir um arquivo de predicoes salvo (--preds), a inferencia e pulada e
-tudo e recalculado em segundos.
-"""
-
 import argparse
 import json
 from collections import Counter
@@ -35,10 +7,7 @@ import numpy as np
 
 LABELS = ["CLEAN", "TYPO", "ABBREV"]
 L2I = {l: i for i, l in enumerate(LABELS)}
-MAX_LEN = 512  # 300 reproduz o corte do script antigo
-
-
-# ---------------------------------------------------------------- inferencia
+MAX_LEN = 512  
 
 def prever(checkpoint, test_data, agregacao):
     """Roda o checkpoint no test set e devolve predicoes por sub-token e por palavra."""
@@ -56,7 +25,6 @@ def prever(checkpoint, test_data, agregacao):
 
     model = AutoModelForTokenClassification.from_pretrained(checkpoint)
     model.eval()
-    # o treino antigo nao salvava o tokenizer no checkpoint; cai para o Hub
     hub = {"bertimbau": "neuralmind/bert-base-portuguese-cased",
            "biobertpt": "pucpr/biobertpt-all"}
     alvos = [checkpoint] + [v for k, v in hub.items() if k in str(origem).lower()]
@@ -90,7 +58,6 @@ def prever(checkpoint, test_data, agregacao):
             logits = model(**enc).logits[0]
             preds = logits.argmax(-1).tolist()
 
-            # sub-token: um rotulo por posicao com word_id valido
             sub_pred, sub_gold = [], []
             por_palavra = {}
             for pos, wid in enumerate(word_ids):
@@ -107,7 +74,7 @@ def prever(checkpoint, test_data, agregacao):
             word_pred, word_gold, word_form = [], [], []
             for wid in range(n_palavras):
                 if wid not in por_palavra:
-                    continue  # palavra cortada pela truncagem
+                    continue 
                 word_pred.append(agregar(por_palavra[wid], agregacao))
                 word_gold.append(L2I[entry["labels"][wid]])
                 word_form.append(entry["tokens"][wid].lower())
@@ -129,12 +96,12 @@ def agregar(preds_da_palavra, modo):
     """Regra de agregacao sub-token -> palavra. Declare no artigo a que voce usar."""
     if modo == "first":
         return preds_da_palavra[0]
-    if modo == "any":  # qualquer sub-token ruidoso torna a palavra ruidosa
+    if modo == "any":  
         for p in preds_da_palavra:
             if p != L2I["CLEAN"]:
                 return p
         return L2I["CLEAN"]
-    # majority: voto majoritario, empate resolvido pelo primeiro sub-token
+
     cont = Counter(preds_da_palavra)
     topo = max(cont.values())
     empatados = [p for p, c in cont.items() if c == topo]
@@ -143,7 +110,6 @@ def agregar(preds_da_palavra, modo):
     return preds_da_palavra[0]
 
 
-# ------------------------------------------------------------------ metricas
 
 def contagens(gold, pred, classe):
     g = np.asarray(gold)
@@ -179,8 +145,6 @@ def matriz_confusao(gold, pred):
         m[g][p] += 1
     return m
 
-
-# ---------------------------------------------------------------- dicionarios
 
 def carregar_formas(filepath):
     """Mesmo loader do verificar_anotacao.py, aceita os formatos da taxonomia."""
@@ -225,8 +189,6 @@ def predizer_dicionario(docs, abbrev_set, typo_set):
     return saida
 
 
-# ----------------------------------------------------------------- bootstrap
-
 def bootstrap_pareado(docs, pred_a, pred_b, classe=L2I["ABBREV"], n=10000, seed=0):
     """Reamostra as anamneses com reposicao e devolve IC e p da diferenca F1(a) - F1(b)."""
     ca, cb = [], []
@@ -251,9 +213,6 @@ def bootstrap_pareado(docs, pred_a, pred_b, classe=L2I["ABBREV"], n=10000, seed=
         "IC95": [round(float(lo), 4), round(float(hi), 4)],
         "p": max(float(p), 1.0 / n),
     }
-
-
-# ---------------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
@@ -329,7 +288,6 @@ def main():
         r.update(metricas_por_classe(gold_w, pred_w, "word"))
         r["matriz_confusao_subtoken"] = matriz_confusao(gold_s, pred_s).tolist()
 
-        # seen x unseen (Tabela 4)
         for particao, pertence in [("seen", True), ("unseen", False)]:
             tp = fn = 0
             for d in docs:
