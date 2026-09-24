@@ -1,23 +1,3 @@
-"""
-medir_faltantes.py  (v2)
-
-Subcomandos:
-
-  densidade          densidade efetiva de ruido por split de treino
-  lowercase          ablacao de caixa alta (rode com o checkpoint EPNI e com o REAL)
-  particoes          recall do modelo por particao de conhecimento do vocabulario
-                     (substitui o antigo "fora-do-top20")
-  formas-exclusivas  monta a lista de formas que so existem na taxonomia por causa
-                     dos 500 registros do teste, para o dicionario_baseline.py
-  split-dev          escolhe a configuracao numa particao de desenvolvimento
-
-    python medir_faltantes.py densidade --datasets datasets_experimento_ruido
-    python medir_faltantes.py lowercase --ckpt modelos_finais/BERTimbau_best
-    python medir_faltantes.py particoes --preds "resultados_experimento/predicoes/preds_*top20_rate50*.json"
-    python medir_faltantes.py formas-exclusivas --corpus corpus_fonte.json
-    python medir_faltantes.py split-dev --preds-dir resultados_experimento/predicoes
-"""
-
 import argparse
 import glob
 import json
@@ -31,7 +11,7 @@ LABELS = ["CLEAN", "TYPO", "ABBREV"]
 L2I = {l: i for i, l in enumerate(LABELS)}
 CLEAN, TYPO, ABBREV = L2I["CLEAN"], L2I["TYPO"], L2I["ABBREV"]
 
-TOKEN_RE = re.compile(r"\b[\w\-]+\b|[^\w\s]", re.UNICODE)  # mesmo de injetar_ruido_ngram.py
+TOKEN_RE = re.compile(r"\b[\w\-]+\b|[^\w\s]", re.UNICODE)
 
 
 def prf(tp, fp, fn):
@@ -73,9 +53,6 @@ def carregar_top20(filepath):
     return ({k.lower() for k in m.get("abbreviations", {})},
             {k.lower() for k in m.get("typos", {})})
 
-
-# ------------------------------------------------------------------ 1. densidade
-
 def cmd_densidade(args):
     arquivos = sorted(glob.glob(str(Path(args.datasets) / "*.json")))
     if args.clean and Path(args.clean).exists():
@@ -94,8 +71,6 @@ def cmd_densidade(args):
     json.dump(linhas, open("densidade_por_split.json", "w"), indent=2)
     print("\nCompare a coluna 'ruido %' com os 13,1% do teste antes de reescrever a 4.3.2 e a 5.2.")
 
-
-# ----------------------------------------------------------------- 2. lowercase
 
 HUB_FALLBACK = {
     "bertimbau": "neuralmind/bert-base-portuguese-cased",
@@ -247,9 +222,6 @@ def cmd_lowercase(args):
               f"ABBREV  P={P:.3f}  R={R:.3f}  F1={F:.3f}")
     print("\nA queda de recall entre as duas linhas e o numero que falta na 5.4.")
 
-
-# ------------------------------------------------- 3. particoes de conhecimento
-
 def cmd_particoes(args):
     """Quebra os tokens ABBREV do gold em tres particoes e mede o recall em cada uma.
 
@@ -347,8 +319,6 @@ def cmd_particoes(args):
     print("\nSalvo em particoes_vocabulario.json")
 
 
-# --------------------------------------------- 4. formas exclusivas do teste
-
 def _texto_dos_registros(path, campo=None):
     """Extrai uma lista de textos de um arquivo de corpus, em varios formatos."""
     if not Path(path).exists():
@@ -417,7 +387,7 @@ def cmd_formas_exclusivas(args):
         c_teste = no_teste.get(forma, 0)
         fora_do_teste = c_corpus if args.corpus_sem_teste else c_corpus - c_teste
         if c_teste == 0:
-            continue  # nao afeta o dicionario neste teste
+            continue 
         if fora_do_teste <= 0:
             exclusivas.append(forma)
         if c_corpus == 0:
@@ -436,8 +406,6 @@ def cmd_formas_exclusivas(args):
         print("\n(assumindo que o corpus-fonte inclui os 500 registros do teste; "
               "se nao incluir, repita com --corpus-sem-teste)")
 
-
-# ---------------------------------------------------------------- 5. split dev
 
 def cmd_split_dev(args):
     arquivos = sorted(glob.glob(str(Path(args.preds_dir) / "preds_*.json")))
