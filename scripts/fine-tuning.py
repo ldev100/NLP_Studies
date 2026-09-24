@@ -1,6 +1,9 @@
 import json
 import os
 import gc
+import hashlib
+import platform
+import random
 import re
 import shutil
 import torch
@@ -10,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from collections import Counter
 from pathlib import Path
 from matplotlib.patches import Patch
 from datasets import Dataset, DatasetDict
@@ -33,6 +37,7 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["LOKY_MAX_CPU_COUNT"] = "1"
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 if torch.backends.mps.is_available():
     print("Apple GPU (MPS) detectada")
@@ -47,7 +52,18 @@ else:
 DATASET_DIR = Path("datasets_experimento_ruido")
 OUTPUT_DIR = Path("resultados_experimento")
 CLEAN_DATASET = Path("clean_synthetic_anamneses_gold_standart_tokens.json")
+REAL_DATASET = Path(os.environ.get("REAL_DATASET", "datasets_experimento_ruido/dataset_real.json"))
 TEST_REAL_FILE = Path("test_set_real.json")
+PREDS_DIR = OUTPUT_DIR / "predicoes"
+
+GOLD_HASH = (
+    hashlib.md5(TEST_REAL_FILE.read_bytes()).hexdigest()[:10]
+    if TEST_REAL_FILE.exists() else "sem-gold"
+)
+
+MANTER_CHECKPOINT = {"top20_rate50", "top20_rate25", "top20_rate10", "real"}
+
+EXIGIR_PREDICOES = os.environ.get("EXIGIR_PREDICOES", "0") == "1"
 
 MODELS = {
     "BERTimbau": "neuralmind/bert-base-portuguese-cased",
@@ -64,6 +80,7 @@ EPOCHS = 10
 PATIENCE = 3
 LR = 2e-5
 MAX_LEN = 300
+EVAL_MAX_LEN = 512
 WEIGHT_DECAY = 0.01
 SEEDS = [42, 123, 456]
 
@@ -71,6 +88,95 @@ CLASS_WEIGHTS = torch.tensor([0.2, 5.0, 15.0])
 
 metric = evaluate.load("seqeval")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(PREDS_DIR, exist_ok=True)
+
+
+def fixar_seed(seed):
+    """Patch (d): fixa todas as fontes de aleatoriedade sob nosso controle."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+
+def registrar_ambiente():
+    """Patch (d): grava o que a reproducao dos numeros depende.
+
+    MPS e CUDA nao garantem determinismo bit a bit, entao o registro do ambiente
+    e o que permite dizer, depois, se uma diferenca vem da semente ou da maquina.
+    """
+    import transformers
+    info = {
+        "gold_hash": GOLD_HASH,
+        "gold_file": str(TEST_REAL_FILE),
+        "device": str(DEVICE),
+        "python": platform.python_version(),
+        "plataforma": platform.platform(),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "numpy": np.__version__,
+        "seeds": SEEDS,
+        "class_weights": CLASS_WEIGHTS.tolist(),
+        "max_len": MAX_LEN,
+        "lr": LR,
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "patience": PATIENCE,
+        "models": MODELS,
+    }
+    with open(OUTPUT_DIR / "ambiente.json", "w") as f:
+        json.dump(info, f, indent=2, ensure_ascii=False)
+    return info
+
+
+def deve_manter(run_name):
+    """Patch (c): o checkpoint deste run sobrevive ao fim da execucao?"""
+    return any(tag in run_name.lower() for tag in MANTER_CHECKPOINT)
+
+
+def salvar_predicoes(run_name, word_ids_col, raw_preds, raw_labels, test_data):
+    """Patch (b): grava a predicao por documento, no nivel de sub-token e de palavra.
+
+    E o arquivo do qual saem, depois, a tabela por sub-token, a tabela por palavra,
+    a particao seen/unseen, a matriz de confusao e o bootstrap pareado. Todas as
+    tabelas passam a vir da mesma passada de inferencia.
+    """
+    docs = []
+    for i, entry in enumerate(test_data):
+        wids = word_ids_col[i]
+        pred_seq, label_seq = raw_preds[i], raw_labels[i]
+
+        sub_pred, sub_gold, por_palavra = [], [], {}
+        for pos in range(len(wids)):
+            if label_seq[pos] == -100:
+                continue
+            sub_pred.append(int(pred_seq[pos]))
+            sub_gold.append(int(label_seq[pos]))
+            por_palavra.setdefault(int(wids[pos]), []).append(int(pred_seq[pos]))
+
+        word_pred, word_gold, word_form = [], [], []
+        for wid in range(len(entry["tokens"])):
+            if wid not in por_palavra:
+                continue  
+            contagem = Counter(por_palavra[wid])
+            topo = max(contagem.values())
+            empatados = [k for k, v in contagem.items() if v == topo]
+            word_pred.append(empatados[0] if len(empatados) == 1 else por_palavra[wid][0])
+            word_gold.append(LABEL2ID[entry["labels"][wid]])
+            word_form.append(entry["tokens"][wid].lower())
+
+        docs.append({
+            "sub_pred": sub_pred, "sub_gold": sub_gold,
+            "word_pred": word_pred, "word_gold": word_gold, "word_form": word_form,
+        })
+
+    with open(PREDS_DIR / f"preds_{run_name}.json", "w") as f:
+        json.dump(docs, f)
 
 class WeightedTrainer(Trainer):
     def __init__(self, class_weights=None, *args, **kwargs):
@@ -128,16 +234,18 @@ def compute_metrics(p):
     }
 
 
-def tokenize_and_align(examples, tokenizer):
+def tokenize_and_align(examples, tokenizer, max_len=MAX_LEN):
     tokenized = tokenizer(
         examples["tokens"],
         truncation=True,
         is_split_into_words=True,
-        max_length=MAX_LEN,
+        max_length=max_len,
     )
     labels = []
+    word_ids_col = [] 
     for i, label_set in enumerate(examples["labels"]):
         word_ids = tokenized.word_ids(batch_index=i)
+        word_ids_col.append([-1 if w is None else w for w in word_ids])
         label_ids = []
         for wid in word_ids:
             if wid is None:
@@ -148,6 +256,7 @@ def tokenize_and_align(examples, tokenizer):
                 label_ids.append(-100)
         labels.append(label_ids)
     tokenized["labels"] = labels
+    tokenized["word_ids_col"] = word_ids_col
     return tokenized
 
 
@@ -156,9 +265,14 @@ def carregar_dataset(filepath):
         data = json.load(f)
     return data
 
-def avaliar_no_test_real(model, tokenizer, test_data):
+def avaliar_no_test_real(model, tokenizer, test_data, run_name=None):
     ds = Dataset.from_list(test_data)
-    ds = ds.map(lambda x: tokenize_and_align(x, tokenizer), batched=True)
+    ds = ds.map(lambda x: tokenize_and_align(x, tokenizer, EVAL_MAX_LEN), batched=True)
+
+    fora = sum(max(0, len(e["tokens"]) - len({w for w in wids if w is not None and w >= 0}))
+               for e, wids in zip(test_data, ds["word_ids_col"]))
+    if fora:
+        print(f"    [!] {fora} palavras fora por truncagem em {EVAL_MAX_LEN} sub-tokens")
 
     data_collator = DataCollatorForTokenClassification(tokenizer)
 
@@ -179,6 +293,9 @@ def avaliar_no_test_real(model, tokenizer, test_data):
     predictions = eval_trainer.predict(ds)
     raw_preds = np.argmax(predictions.predictions, axis=2)
     raw_labels = predictions.label_ids
+
+    if run_name:
+        salvar_predicoes(run_name, ds["word_ids_col"], raw_preds, raw_labels, test_data)
 
     all_preds = []
     all_labels = []
@@ -251,8 +368,7 @@ def avaliar_no_test_real(model, tokenizer, test_data):
 def train_and_evaluate(ds_path, model_alias, model_ckpt, test_real_data, seed):
     limpar_memoria()
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    fixar_seed(seed)
 
     data = carregar_dataset(ds_path)
 
@@ -295,6 +411,8 @@ def train_and_evaluate(ds_path, model_alias, model_ckpt, test_real_data, seed):
         greater_is_better=True,
         report_to="none",
         seed=seed,
+        data_seed=seed,
+        dataloader_num_workers=0,
         fp16=False,
     )
 
@@ -316,6 +434,11 @@ def train_and_evaluate(ds_path, model_alias, model_ckpt, test_real_data, seed):
 
     trainer.train()
 
+    try:
+        tokenizer.save_pretrained(args.output_dir)
+    except Exception as e:
+        print(f"    [!] nao foi possivel salvar o tokenizer: {e}")
+
     val_results = trainer.evaluate()
     print(f"    Val F1 (sintetico): {val_results.get('eval_f1', 0):.4f}")
 
@@ -325,7 +448,7 @@ def train_and_evaluate(ds_path, model_alias, model_ckpt, test_real_data, seed):
     print(f"    Avaliando no test set REAL...")
     model.cpu()
     limpar_memoria()
-    test_metricas = avaliar_no_test_real(model, tokenizer, test_real_data)
+    test_metricas = avaliar_no_test_real(model, tokenizer, test_real_data, run_name=run_name)
 
     print(f"    -> ABBREV F1:        {test_metricas['abbrev_f1']:.4f}")
     print(f"    -> TYPO F1:          {test_metricas['typo_f1']:.4f}")
@@ -336,6 +459,7 @@ def train_and_evaluate(ds_path, model_alias, model_ckpt, test_real_data, seed):
         "config": config_tag,
         "model": model_alias,
         "seed": seed,
+        "gold_hash": GOLD_HASH,
         "val_f1_sintetico": val_results.get("eval_f1", 0),
         **test_metricas,
     }
@@ -358,7 +482,10 @@ def main():
 
     print("[1/4] Carregando test set real...")
     test_real_data = carregar_dataset(TEST_REAL_FILE)
-    print(f"       {len(test_real_data)} anamneses reais")
+    n_tokens = sum(len(e["tokens"]) for e in test_real_data)
+    print(f"       {len(test_real_data)} anamneses reais, {n_tokens} tokens")
+    print(f"       gold_hash = {GOLD_HASH}")
+    registrar_ambiente()
 
     print("[2/4] Listando datasets de treino...")
     train_datasets = []
@@ -381,6 +508,20 @@ def main():
         train_datasets.append((config_name, str(f)))
         print(f"       [ok] {config_name}: {f}")
 
+    if REAL_DATASET.exists():
+        real_data = carregar_dataset(REAL_DATASET)
+        assinaturas_teste = {tuple(e["tokens"]) for e in test_real_data}
+        sobrepostos = sum(1 for e in real_data if tuple(e["tokens"]) in assinaturas_teste)
+        if sobrepostos:
+            raise SystemExit(
+                f"[!!] {sobrepostos} anamneses do REAL sao identicas a anamneses do teste. "
+                f"O REAL precisa ser disjunto do teste; corrija o arquivo antes de treinar."
+            )
+        train_datasets.append(("REAL", str(REAL_DATASET)))
+        print(f"       [ok] REAL: {REAL_DATASET} ({len(real_data)} anamneses, disjunto do teste)")
+    else:
+        print(f"       [--] REAL nao encontrado em {REAL_DATASET} (ignorado)")
+
     total_runs = len(train_datasets) * len(MODELS) * len(SEEDS)
     print(f"\n       Total: {len(train_datasets)} configs x {len(MODELS)} modelos x {len(SEEDS)} seeds = {total_runs} runs")
     print(f"       Tempo estimado: {total_runs * 10 // 60}-{total_runs * 15 // 60} horas")
@@ -391,17 +532,24 @@ def main():
     runs_erro = 0
     runs_pulados = 0
 
+    descartados = 0
     for res_file in sorted(OUTPUT_DIR.glob("res_*.json")):
         try:
             with open(res_file, "r") as f:
                 resultado_anterior = json.load(f)
-            if "model" in resultado_anterior and "macro_f1_noise" in resultado_anterior:
-                todos_resultados.append(resultado_anterior)
-        except:
-            pass
+        except Exception:
+            continue
+        if "model" not in resultado_anterior or "macro_f1_noise" not in resultado_anterior:
+            continue
+        if resultado_anterior.get("gold_hash") != GOLD_HASH:
+            descartados += 1  # Patch (a): calculado sobre outro gold
+            continue
+        todos_resultados.append(resultado_anterior)
 
     if todos_resultados:
         print(f"       Carregados {len(todos_resultados)} resultados anteriores")
+    if descartados:
+        print(f"       [!] {descartados} resultados ignorados: gold diferente do atual")
 
     melhor_por_modelo = {}
 
@@ -423,9 +571,19 @@ def main():
 
                 result_file = OUTPUT_DIR / f"res_{run_name}.json"
                 if result_file.exists():
-                    print(f"\n    [PULANDO] {run_name} (ja completado)")
-                    runs_pulados += 1
-                    continue
+                    try:
+                        anterior = json.load(open(result_file))
+                    except Exception:
+                        anterior = {}
+                    mesmo_gold = anterior.get("gold_hash") == GOLD_HASH
+                    tem_preds = (PREDS_DIR / f"preds_{run_name}.json").exists()
+                    if mesmo_gold and (tem_preds or not EXIGIR_PREDICOES):
+                        obs = "" if tem_preds else ", sem predicoes"
+                        print(f"\n    [PULANDO] {run_name} (ja completado com este gold{obs})")
+                        runs_pulados += 1
+                        continue
+                    motivo = "gold diferente" if not mesmo_gold else "predicoes ausentes"
+                    print(f"\n    [REFAZENDO] {run_name} ({motivo})")
 
                 try:
                     resultado = train_and_evaluate(
@@ -436,16 +594,19 @@ def main():
 
                     f1_atual = resultado["macro_f1_noise"]
 
-                    if model_alias not in melhor_por_modelo or f1_atual > melhor_por_modelo[model_alias]["f1"]:
+                    if config_tag.lower() == "real":
+                        pass  # referencia superior, nao entra na escolha do melhor EPNI
+                    elif model_alias not in melhor_por_modelo or f1_atual > melhor_por_modelo[model_alias]["f1"]:
                         if model_alias in melhor_por_modelo:
-                            old_dir = Path(f"./checkpoints/{melhor_por_modelo[model_alias]['run_name']}")
-                            if old_dir.exists():
+                            anterior_run = melhor_por_modelo[model_alias]["run_name"]
+                            old_dir = Path(f"./checkpoints/{anterior_run}")
+                            if old_dir.exists() and not deve_manter(anterior_run):
                                 shutil.rmtree(old_dir)
                         melhor_por_modelo[model_alias] = {"f1": f1_atual, "run_name": run_name}
                         print(f"    ** Novo melhor {model_alias}: {run_name} (F1={f1_atual:.4f})")
                     else:
                         ckpt_dir = Path(f"./checkpoints/{run_name}")
-                        if ckpt_dir.exists():
+                        if ckpt_dir.exists() and not deve_manter(run_name):
                             shutil.rmtree(ckpt_dir)
 
                 except Exception as e:
@@ -476,7 +637,15 @@ def main():
 
     ckpt_root = Path("./checkpoints")
     if ckpt_root.exists():
-        shutil.rmtree(ckpt_root)
+        for ckpt in sorted(ckpt_root.iterdir()):
+            if not ckpt.is_dir() or not deve_manter(ckpt.name):
+                continue
+            dst = modelos_dir / ckpt.name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.move(str(ckpt), str(dst))
+            print(f"    Checkpoint preservado: {dst}/")
+        shutil.rmtree(ckpt_root, ignore_errors=True)
 
     print("[4/4] Gerando tabelas e graficos...")
     gerar_outputs(todos_resultados)
@@ -485,6 +654,12 @@ def main():
     print("=" * 60)
     print(f"[OK] Concluido! {runs_ok} novos + {runs_pulados} anteriores")
     print(f"    Resultados em: {OUTPUT_DIR}/")
+    print(f"    Predicoes por run em: {PREDS_DIR}/")
+    print(f"    gold_hash = {GOLD_HASH} (registrado em cada res_*.json)")
+    print()
+    print("    Proximos passos:")
+    print("      python reavaliar_word_level.py --preds-dir " + str(PREDS_DIR))
+    print("      python medir_faltantes.py split-dev --preds-dir " + str(PREDS_DIR))
     print("=" * 60)
 
 def gerar_outputs(resultados):
@@ -508,6 +683,7 @@ def gerar_outputs(resultados):
         'top20_rate10': 'TOP20-R10',
         'top20_rate25': 'TOP20-R25',
         'top20_rate50': 'TOP20-R50',
+        'real': 'REAL',
     }
     df['config'] = df['config'].map(rename).fillna(df['config'])
 
@@ -515,7 +691,8 @@ def gerar_outputs(resultados):
              "RANDOM-10", "RANDOM-25", "RANDOM-50",
              "TOP10-R10", "TOP10-R25", "TOP10-R50",
              "TOP15-R10", "TOP15-R25", "TOP15-R50",
-             "TOP20-R10", "TOP20-R25", "TOP20-R50"]
+             "TOP20-R10", "TOP20-R25", "TOP20-R50",
+             "REAL"]
 
     has_binary = "binary_noise_f1" in df.columns
 
